@@ -54,9 +54,9 @@ async function urlToGenerativePart(url, mimeType) {
     };
 }
 
-// Resilient Gemini generator with retry and fallback across models
+// Resilient Gemini generator using the active 3.8 models
 async function generateWithRetry(promptContent, retries = 2) {
-    const models = ['gemini-2.0-flash', 'gemini-1.5-flash'];
+    const models = ['gemini-3.8-flash', 'gemini-3.8-pro'];
 
     for (const modelName of models) {
         const selectedModel = genAI.getGenerativeModel({ model: modelName });
@@ -70,7 +70,7 @@ async function generateWithRetry(promptContent, retries = 2) {
                     await new Promise((res) => setTimeout(res, 1500));
                 } else {
                     console.error(`Error on ${modelName}:`, err.message || err);
-                    break;
+                    break; // Move to fallback model
                 }
             }
         }
@@ -152,7 +152,7 @@ app.post('/sms', async (req, res) => {
     } catch (err) {
         console.error('Webhook processing error:', err);
 
-        twiml.message("Bouncer is handling a line at the door. Try texting your commitment again in 30 seconds.");
+        twiml.message("yo dude the message isnt working send it again in thirty seconds");
         res.type('text/xml');
         res.send(twiml.toString());
     }
