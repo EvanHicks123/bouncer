@@ -27,6 +27,16 @@ Your personality & dynamic:
 - Keep messages short and punchy (1 to 3 sentences max). Never sound like a corporate AI bot.
 `;
 
+const SALES_PROMPT_DIRECTIVE = `
+IMPORTANT CONTEXT: The user's 3-day free trial has expired and they are NOT on the Pro plan yet.
+Your goal is to gently break the news and persuade them to subscribe ($4.99/mo) while staying completely in character as their friend:
+- Do NOT act like a harsh paywall or a corporate bot.
+- First time breaking the news: Be like "oh crap dude sorry but your trial just ran out... but it's only 4.99 if you wanna keep going: https://buy.stripe.com/your_link_here".
+- If they hesitate, object, or say they don't have $5: Persuade them like a bro ("if this 5 dollars gets your ass off the couch and in the gym then it will be worth it trust me dude").
+- Do NOT accept new workout commitments or verify photos until they subscribe, but do keep bantering and convincing them to get the pass.
+- Always include the checkout link if they seem on the fence: https://buy.stripe.com/your_link_here
+`;
+
 // Helper: Convert Twilio MMS URL to Gemini-compatible generative part
 async function urlToGenerativePart(url, mimeType) {
     const response = await axios.get(url, {
@@ -60,7 +70,7 @@ async function generateWithRetry(promptContent, retries = 2) {
                     await new Promise((res) => setTimeout(res, 1500));
                 } else {
                     console.error(`Error on ${modelName}:`, err.message || err);
-                    break; // Try fallback model if non-capacity issue
+                    break;
                 }
             }
         }
@@ -93,9 +103,16 @@ app.post('/sms', async (req, res) => {
             .single();
 
         if (!user) {
+            const trialEnds = new Date();
+            trialEnds.setDate(trialEnds.getDate() + 3);
+
             const { data: newUser, error: insertError } = await supabase
                 .from('users')
-                .insert([{ phone_number: fromNumber }])
+                .insert([{
+                    phone_number: fromNumber,
+                    status: 'trial',
+                    trial_ends_at: trialEnds.toISOString(),
+                }])
                 .select()
                 .single();
 
@@ -105,37 +122,36 @@ app.post('/sms', async (req, res) => {
             user = newUser;
         }
 
-        // 2. Check trial & subscription access
-        const isExpired = user && user.status === 'trial' && new Date() > new Date(user.trial_ends_at);
-        if (isExpired && user.status !== 'pro') {
-            const paywallMsg =
-                "Whoa there, trial's expired. You're not getting past the ropes without a wristband. Tap here to lock in Pro ($5/mo): https://buy.stripe.com/your_link_here";
+        // 2. Safe check if trial has expired
+        const hasValidDate = user && user.trial_ends_at;
+        const isExpired = user && user.status === 'trial' && hasValidDate && (new Date() > new Date(user.trial_ends_at));
 
-            twiml.message(paywallMsg);
-            res.type('text/xml');
-            return res.send(twiml.toString());
+        // 3. Assemble Prompt based on status
+        let activePrompt = BOUNCER_SYSTEM_PROMPT;
+        if (isExpired && user.status !== 'pro') {
+            activePrompt += `\n${SALES_PROMPT_DIRECTIVE}`;
         }
 
-        // 3. Build Gemini content & generate reply
+        // 4. Generate AI response
         let botReply = '';
 
         if (numMedia > 0 && mediaUrl) {
             const imagePart = await urlToGenerativePart(mediaUrl, mediaContentType);
-            const prompt = `${BOUNCER_SYSTEM_PROMPT}\nUser submitted this image as proof with comment: "${userText}". Analyze it strictly.`;
+            const prompt = `${activePrompt}\nUser submitted an image proof with message: "${userText}".`;
             botReply = await generateWithRetry([prompt, imagePart]);
         } else {
-            const prompt = `${BOUNCER_SYSTEM_PROMPT}\nUser message: "${userText}"`;
+            const prompt = `${activePrompt}\nUser message: "${userText}"`;
             botReply = await generateWithRetry(prompt);
         }
 
-        // 4. Return TwiML XML to Twilio
+        // 5. Send back via TwiML XML
         twiml.message(botReply);
         res.type('text/xml');
         res.send(twiml.toString());
+
     } catch (err) {
         console.error('Webhook processing error:', err);
 
-        // Friendly fallback so user isn't left hanging on read
         twiml.message("Bouncer is handling a line at the door. Try texting your commitment again in 30 seconds.");
         res.type('text/xml');
         res.send(twiml.toString());
