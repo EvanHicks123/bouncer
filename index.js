@@ -14,18 +14,17 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Initialize Twilio
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const BOUNCER_SYSTEM_PROMPT = `
-You are "Bouncer", an uncompromising, sarcastic, and hilarious accountability partner on WhatsApp.
-Your job:
-1. If the user states a goal/commitment, acknowledge it strictly. Hold them to it.
-2. If they send an image as proof, scrutinize it aggressively. If it's fake or lazy (e.g. a photo of the floor, a random water bottle, a blurry ceiling), roast them and reject it. If it's valid proof, begrudgingly approve it.
-3. Keep responses punchy, concise, and under 3-4 sentences. Talk like a bouncer guarding an exclusive club.
+You are "Bouncer", the user's friend and accountability partner on WhatsApp. 
+Your personality & dynamic:
+- You text like a real friend in their late teens/early 20s: casual, lowercase/minimal punctuation if it feels natural, current humor ("let's frickin go", calling them a "chud" when they act lazy, teasing banter).
+- When they lock in a commitment: Hype them up like a bro ("8:30 gym session? let's frickin go, lock it in").
+- When they actually deliver and send legitimate proof: Be genuinely supportive and proud of them, not toxic. Give real respect ("alright respect, you actually showed up. let's keep that streak alive").
+- When they slack, make lame excuses, or send lazy/fake proof (floor photos, random objects, bad excuses): Roast their ass ruthlessly and call them out like a friend who refuses to watch them fail ("bro sent a blurry photo of a carpet thinking he beat the system, stop being a chud and go actually lift").
+- Keep messages short and punchy (1 to 3 sentences max). Never sound like a corporate AI bot.
 `;
 
 // Helper: Convert Twilio MMS URL to Gemini-compatible generative part
@@ -61,7 +60,7 @@ async function generateWithRetry(promptContent, retries = 2) {
                     await new Promise((res) => setTimeout(res, 1500));
                 } else {
                     console.error(`Error on ${modelName}:`, err.message || err);
-                    break; // Move to the next model if it's another type of error
+                    break; // Try fallback model if non-capacity issue
                 }
             }
         }
@@ -76,6 +75,9 @@ app.get('/', (req, res) => {
 
 // 2. Main Twilio WhatsApp Webhook
 app.post('/sms', async (req, res) => {
+    const { MessagingResponse } = twilio.twiml;
+    const twiml = new MessagingResponse();
+
     const fromNumber = req.body.From; // e.g. 'whatsapp:+1234567890'
     const userText = req.body.Body || '';
     const numMedia = parseInt(req.body.NumMedia || '0', 10);
@@ -109,12 +111,9 @@ app.post('/sms', async (req, res) => {
             const paywallMsg =
                 "Whoa there, trial's expired. You're not getting past the ropes without a wristband. Tap here to lock in Pro ($5/mo): https://buy.stripe.com/your_link_here";
 
-            await twilioClient.messages.create({
-                from: process.env.TWILIO_PHONE_NUMBER,
-                to: fromNumber,
-                body: paywallMsg,
-            });
-            return res.sendStatus(200);
+            twiml.message(paywallMsg);
+            res.type('text/xml');
+            return res.send(twiml.toString());
         }
 
         // 3. Build Gemini content & generate reply
@@ -129,29 +128,17 @@ app.post('/sms', async (req, res) => {
             botReply = await generateWithRetry(prompt);
         }
 
-        // 4. Send WhatsApp response back via Twilio
-        await twilioClient.messages.create({
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: fromNumber,
-            body: botReply,
-        });
-
-        res.sendStatus(200);
+        // 4. Return TwiML XML to Twilio
+        twiml.message(botReply);
+        res.type('text/xml');
+        res.send(twiml.toString());
     } catch (err) {
         console.error('Webhook processing error:', err);
 
         // Friendly fallback so user isn't left hanging on read
-        try {
-            await twilioClient.messages.create({
-                from: process.env.TWILIO_PHONE_NUMBER,
-                to: fromNumber,
-                body: "Bouncer is handling a line at the door. Try texting your commitment again in 30 seconds.",
-            });
-        } catch (twilioErr) {
-            console.error('Twilio fallback error:', twilioErr);
-        }
-
-        res.sendStatus(200);
+        twiml.message("Bouncer is handling a line at the door. Try texting your commitment again in 30 seconds.");
+        res.type('text/xml');
+        res.send(twiml.toString());
     }
 });
 
