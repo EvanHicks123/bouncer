@@ -57,9 +57,9 @@ async function urlToGenerativePart(url, mimeType) {
     };
 }
 
-// Resilient Gemini generator
+// Resilient Gemini generator locked to the active working model
 async function generateWithRetry(promptContent, retries = 2) {
-    const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+    const models = ['gemini-3.8-flash'];
 
     for (const modelName of models) {
         try {
@@ -69,6 +69,7 @@ async function generateWithRetry(promptContent, retries = 2) {
                     const result = await selectedModel.generateContent(promptContent);
                     return result.response.text().replace(/\n+/g, ' ').trim();
                 } catch (err) {
+                    console.error(`Gemini attempt ${attempt + 1} error:`, err.message || err);
                     if (err.status === 503 || err.message?.includes('503')) {
                         await new Promise((res) => setTimeout(res, 1200));
                     } else {
@@ -83,7 +84,7 @@ async function generateWithRetry(promptContent, retries = 2) {
     throw new Error('All models exhausted');
 }
 
-// Background retry worker with safe Twilio message handling
+// Background retry worker with safe WhatsApp prefixes and error handling
 async function resolveInBackground(fromNumber, promptPayload) {
     try {
         const reply = await generateWithRetry(promptPayload, 3);
@@ -92,7 +93,6 @@ async function resolveInBackground(fromNumber, promptPayload) {
         history.push({ role: 'model', text: reply });
         userHistories.set(fromNumber, history.slice(-6));
 
-        // Ensure 'whatsapp:' prefix is preserved for Twilio WhatsApp API
         const formattedTo = fromNumber.startsWith('whatsapp:') ? fromNumber : `whatsapp:${fromNumber}`;
         const formattedFrom = process.env.TWILIO_PHONE_NUMBER.startsWith('whatsapp:')
             ? process.env.TWILIO_PHONE_NUMBER
@@ -106,7 +106,6 @@ async function resolveInBackground(fromNumber, promptPayload) {
     } catch (err) {
         console.error('Background worker caught error:', err.message || err);
     } finally {
-        // Release the user lock regardless of success or failure
         activeLocks.delete(fromNumber);
     }
 }
@@ -123,7 +122,7 @@ app.post('/sms', async (req, res) => {
     const mediaUrl = req.body.MediaUrl0;
     const mediaContentType = req.body.MediaContentType0;
 
-    // 1. If currently processing in background and user sends rapid follow-up
+    // 1. Lock check: if waiting on background retry and user follows up fast
     if (activeLocks.has(fromNumber)) {
         twiml.message("just wait a sec");
         res.type('text/xml');
@@ -131,7 +130,7 @@ app.post('/sms', async (req, res) => {
     }
 
     try {
-        // 2. Fetch or create Supabase user record
+        // 2. Fetch or initialize user in Supabase
         let { data: user } = await supabase
             .from('users')
             .select('*')
@@ -175,7 +174,7 @@ app.post('/sms', async (req, res) => {
             promptPayload = `${systemInstructions}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
         }
 
-        // Append user input to history
+        // Append to local history
         history.push({ role: 'user', text: userText || '[sent media]' });
         userHistories.set(fromNumber, history.slice(-6));
 
@@ -184,7 +183,6 @@ app.post('/sms', async (req, res) => {
         try {
             botReply = await generateWithRetry(promptPayload, 2);
         } catch (fastErr) {
-            // Hand off to background worker safely and respond immediately via TwiML
             activeLocks.add(fromNumber);
             resolveInBackground(fromNumber, promptPayload);
 
