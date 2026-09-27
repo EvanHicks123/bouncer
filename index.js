@@ -33,11 +33,17 @@ Your texting style:
 - If they make excuses, send fake proof, or slack off, clown them and call them a chud.
 - Remember recent context so you never ask something they literally just told you.
 
-IMPORTANT EXTRACTION INSTRUCTION:
-If the user committed to an action with an explicit or implied deadline (e.g. "at 12:03am", "at 11:25am", "in 30 mins", "at 9pm"), calculate the exact target UTC time using the provided "Current UTC Time".
-Append a hidden tag at the very end of your response formatted EXACTLY like this:
-<<<{"has_deadline": true, "target_iso": "YYYY-MM-DDTHH:MM:SSZ", "goal": "gym"}>>>
-If there is NO time commitment, DO NOT output any <<<>>> tags.
+IMPORTANT EXTRACTION INSTRUCTIONS:
+1. Deadlines:
+Using the user's provided "Current User Local Time", if the user committed to an action with an explicit or implied deadline (e.g. "in 2 mins", "at 11:45am", "tonight at 9pm"), calculate how many minutes from right now that deadline is.
+Append a hidden deadline tag at the end:
+<<<{"has_deadline": true, "minutes_from_now": 15, "goal": "gym"}>>>
+
+2. Timezone Updates:
+If the user mentions their city, state, or timezone (e.g., "i'm in toronto", "i live in london", "pst", "est"), append a hidden timezone tag with a valid IANA timezone string:
+<<<{"update_timezone": "America/Toronto"}>>>
+
+If neither applies, do NOT output any <<<>>> tags.
 `;
 
 const SALES_PROMPT_DIRECTIVE = `
@@ -111,12 +117,14 @@ app.post('/sms', async (req, res) => {
                     phone_number: fromNumber,
                     status: 'trial',
                     trial_ends_at: trialEnds.toISOString(),
+                    timezone: 'America/Vancouver',
                 }])
                 .select()
                 .single();
             user = newUser;
         }
 
+        const userTimezone = user?.timezone || 'America/Vancouver';
         const hasValidDate = user && user.trial_ends_at;
         const isExpired = user && user.status === 'trial' && hasValidDate && (new Date() > new Date(user.trial_ends_at));
 
@@ -129,8 +137,24 @@ app.post('/sms', async (req, res) => {
                 .eq('completed', false);
         }
 
-        // 3. Assemble chat context with current timestamp
-        const currentTimeStr = new Date().toISOString();
+        // 3. Assemble chat context with user's specific local time
+        let localTimeStr;
+        try {
+            localTimeStr = new Date().toLocaleTimeString('en-US', {
+                timeZone: userTimezone,
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true,
+            });
+        } catch {
+            localTimeStr = new Date().toLocaleTimeString('en-US', {
+                timeZone: 'America/Vancouver',
+                hour: 'numeric',
+                minute: '2-digit',
+                hour12: true,
+            });
+        }
+
         let history = userHistories.get(fromNumber) || [];
         let historyText = history.map((h) => `${h.role === 'user' ? 'User' : 'Bouncer'}: "${h.text}"`).join('\n');
 
@@ -142,10 +166,10 @@ app.post('/sms', async (req, res) => {
         let promptPayload;
         if (numMedia > 0 && mediaUrl) {
             const imagePart = await urlToGenerativePart(mediaUrl, mediaContentType);
-            const prompt = `${systemInstructions}\nCurrent UTC Time: ${currentTimeStr}\nRecent context:\n${historyText}\nUser sent image proof with comment: "${userText}"`;
+            const prompt = `${systemInstructions}\nUser Timezone: ${userTimezone}\nCurrent User Local Time: ${localTimeStr}\nRecent context:\n${historyText}\nUser sent image proof with comment: "${userText}"`;
             promptPayload = [prompt, imagePart];
         } else {
-            promptPayload = `${systemInstructions}\nCurrent UTC Time: ${currentTimeStr}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
+            promptPayload = `${systemInstructions}\nUser Timezone: ${userTimezone}\nCurrent User Local Time: ${localTimeStr}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
         }
 
         history.push({ role: 'user', text: userText || '[sent media]' });
@@ -153,21 +177,35 @@ app.post('/sms', async (req, res) => {
         // 4. Generate reply
         const rawReply = await generateWithRetry(promptPayload, 3);
 
-        // Extract hidden deadline tag if present
+        // Parse hidden tags (deadline or timezone updates)
         let cleanReply = rawReply;
-        const jsonMatch = rawReply.match(/<<<([\s\S]*?)>>>/);
-        if (jsonMatch) {
-            try {
-                const parsed = JSON.parse(jsonMatch[1]);
-                if (parsed.has_deadline && parsed.target_iso) {
-                    await supabase.from('reminders').insert([{
-                        phone_number: fromNumber,
-                        goal_text: parsed.goal || 'your commitment',
-                        target_time: new Date(parsed.target_iso).toISOString(),
-                    }]);
+        const jsonMatches = rawReply.match(/<<<([\s\S]*?)>>>/g);
+        if (jsonMatches) {
+            for (const rawTag of jsonMatches) {
+                try {
+                    const content = rawTag.replace(/<<<|>>>/g, '').trim();
+                    const parsed = JSON.parse(content);
+
+                    // Handle deadline extraction
+                    if (parsed.has_deadline && typeof parsed.minutes_from_now === 'number') {
+                        const target = new Date(Date.now() + Math.max(1, parsed.minutes_from_now) * 60000);
+                        await supabase.from('reminders').insert([{
+                            phone_number: fromNumber,
+                            goal_text: parsed.goal || 'your commitment',
+                            target_time: target.toISOString(),
+                        }]);
+                    }
+
+                    // Handle dynamic timezone update
+                    if (parsed.update_timezone) {
+                        await supabase
+                            .from('users')
+                            .update({ timezone: parsed.update_timezone })
+                            .eq('phone_number', fromNumber);
+                    }
+                } catch (e) {
+                    console.error('Failed to parse tag:', e);
                 }
-            } catch (e) {
-                console.error('Failed to parse deadline tag:', e);
             }
             cleanReply = rawReply.replace(/<<<[\s\S]*?>>>/g, '').trim();
         }
@@ -221,7 +259,6 @@ Single line text bubble only, lowercase, no line breaks.
                 const rawRoast = await generateWithRetry(nagPrompt, 2);
                 const roast = rawRoast.replace(/\n+/g, ' ').trim();
 
-                // Ensure both From and To have the exact 'whatsapp:' prefix required by Twilio
                 const rawTo = item.phone_number.replace(/^whatsapp:/, '').trim();
                 const rawFrom = (process.env.TWILIO_PHONE_NUMBER || '').replace(/^whatsapp:/, '').trim();
 
@@ -242,7 +279,6 @@ Single line text bubble only, lowercase, no line breaks.
 
             } catch (sendErr) {
                 console.error(`Failed to send nag message for reminder ${item.id}:`, sendErr.message || sendErr);
-                // Mark as nagged even on failure so it stops choking future cron runs
                 await supabase
                     .from('reminders')
                     .update({ nagged: true })
@@ -250,7 +286,6 @@ Single line text bubble only, lowercase, no line breaks.
             }
         }
 
-        // Always respond with 200 so cron-job.org stays alive
         res.status(200).json({ checked: overdueList.length });
     } catch (err) {
         console.error('Fatal cron check error:', err.message || err);
