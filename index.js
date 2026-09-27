@@ -19,7 +19,6 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
 const BOUNCER_SYSTEM_PROMPT = `
 You are "Bouncer", an uncompromising, sarcastic, and hilarious accountability partner on WhatsApp.
@@ -29,7 +28,7 @@ Your job:
 3. Keep responses punchy, concise, and under 3-4 sentences. Talk like a bouncer guarding an exclusive club.
 `;
 
-// Helper: Convert image URL to Gemini-compatible generative part
+// Helper: Convert Twilio MMS URL to Gemini-compatible generative part
 async function urlToGenerativePart(url, mimeType) {
     const response = await axios.get(url, {
         responseType: 'arraybuffer',
@@ -46,6 +45,30 @@ async function urlToGenerativePart(url, mimeType) {
     };
 }
 
+// Resilient Gemini generator with retry and fallback across models
+async function generateWithRetry(promptContent, retries = 2) {
+    const models = ['gemini-2.0-flash', 'gemini-1.5-flash'];
+
+    for (const modelName of models) {
+        const selectedModel = genAI.getGenerativeModel({ model: modelName });
+        for (let attempt = 0; attempt < retries; attempt++) {
+            try {
+                const result = await selectedModel.generateContent(promptContent);
+                return result.response.text();
+            } catch (err) {
+                if (err.status === 503 || err.message?.includes('503')) {
+                    console.log(`503 on ${modelName}, waiting 1.5s... (Attempt ${attempt + 1})`);
+                    await new Promise((res) => setTimeout(res, 1500));
+                } else {
+                    console.error(`Error on ${modelName}:`, err.message || err);
+                    break; // Move to the next model if it's another type of error
+                }
+            }
+        }
+    }
+    throw new Error('All Gemini models and retries exhausted.');
+}
+
 // 1. Keepalive endpoint for cron-job.org
 app.get('/', (req, res) => {
     res.status(200).send('Bouncer is active and awake.');
@@ -60,7 +83,7 @@ app.post('/sms', async (req, res) => {
     const mediaContentType = req.body.MediaContentType0;
 
     try {
-        // Check or create user in Supabase
+        // 1. Check or create user in Supabase
         let { data: user, error: userFetchError } = await supabase
             .from('users')
             .select('*')
@@ -80,7 +103,7 @@ app.post('/sms', async (req, res) => {
             user = newUser;
         }
 
-        // Check trial & subscription access
+        // 2. Check trial & subscription access
         const isExpired = user && user.status === 'trial' && new Date() > new Date(user.trial_ends_at);
         if (isExpired && user.status !== 'pro') {
             const paywallMsg =
@@ -94,24 +117,19 @@ app.post('/sms', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // Build Gemini prompt
+        // 3. Build Gemini content & generate reply
         let botReply = '';
 
         if (numMedia > 0 && mediaUrl) {
-            // User sent an image proof
             const imagePart = await urlToGenerativePart(mediaUrl, mediaContentType);
             const prompt = `${BOUNCER_SYSTEM_PROMPT}\nUser submitted this image as proof with comment: "${userText}". Analyze it strictly.`;
-
-            const result = await model.generateContent([prompt, imagePart]);
-            botReply = result.response.text();
+            botReply = await generateWithRetry([prompt, imagePart]);
         } else {
-            // User sent a plain text message
             const prompt = `${BOUNCER_SYSTEM_PROMPT}\nUser message: "${userText}"`;
-            const result = await model.generateContent(prompt);
-            botReply = result.response.text();
+            botReply = await generateWithRetry(prompt);
         }
 
-        // Send WhatsApp response back via Twilio
+        // 4. Send WhatsApp response back via Twilio
         await twilioClient.messages.create({
             from: process.env.TWILIO_PHONE_NUMBER,
             to: fromNumber,
@@ -120,8 +138,20 @@ app.post('/sms', async (req, res) => {
 
         res.sendStatus(200);
     } catch (err) {
-        console.error('Webhook error:', err);
-        res.sendStatus(500);
+        console.error('Webhook processing error:', err);
+
+        // Friendly fallback so user isn't left hanging on read
+        try {
+            await twilioClient.messages.create({
+                from: process.env.TWILIO_PHONE_NUMBER,
+                to: fromNumber,
+                body: "Bouncer is handling a line at the door. Try texting your commitment again in 30 seconds.",
+            });
+        } catch (twilioErr) {
+            console.error('Twilio fallback error:', twilioErr);
+        }
+
+        res.sendStatus(200);
     }
 });
 
