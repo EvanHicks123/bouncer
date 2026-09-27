@@ -34,9 +34,10 @@ Your texting style:
 - Remember recent context so you never ask something they literally just told you.
 
 IMPORTANT EXTRACTION INSTRUCTION:
-If the user committed to an action with an implied or explicit deadline in their message (e.g., "gym at 11pm", "running in 30 mins"), output a hidden JSON tag at the very end of your response formatted EXACTLY like this:
-<<<{"has_deadline": true, "minutes_from_now": 30, "goal": "gym"}>>>
-Estimate "minutes_from_now" relative to the current conversation. If there is NO time commitment, DO NOT output any <<<>>> tags.
+If the user committed to an action with an explicit or implied deadline (e.g. "at 12:03am", "at 11:25am", "in 30 mins", "at 9pm"), calculate the exact target UTC time using the provided "Current UTC Time".
+Append a hidden tag at the very end of your response formatted EXACTLY like this:
+<<<{"has_deadline": true, "target_iso": "YYYY-MM-DDTHH:MM:SSZ", "goal": "gym"}>>>
+If there is NO time commitment, DO NOT output any <<<>>> tags.
 `;
 
 const SALES_PROMPT_DIRECTIVE = `
@@ -128,7 +129,8 @@ app.post('/sms', async (req, res) => {
                 .eq('completed', false);
         }
 
-        // 3. Assemble chat context
+        // 3. Assemble chat context with current timestamp
+        const currentTimeStr = new Date().toISOString();
         let history = userHistories.get(fromNumber) || [];
         let historyText = history.map((h) => `${h.role === 'user' ? 'User' : 'Bouncer'}: "${h.text}"`).join('\n');
 
@@ -140,10 +142,10 @@ app.post('/sms', async (req, res) => {
         let promptPayload;
         if (numMedia > 0 && mediaUrl) {
             const imagePart = await urlToGenerativePart(mediaUrl, mediaContentType);
-            const prompt = `${systemInstructions}\nRecent context:\n${historyText}\nUser sent image proof with comment: "${userText}"`;
+            const prompt = `${systemInstructions}\nCurrent UTC Time: ${currentTimeStr}\nRecent context:\n${historyText}\nUser sent image proof with comment: "${userText}"`;
             promptPayload = [prompt, imagePart];
         } else {
-            promptPayload = `${systemInstructions}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
+            promptPayload = `${systemInstructions}\nCurrent UTC Time: ${currentTimeStr}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
         }
 
         history.push({ role: 'user', text: userText || '[sent media]' });
@@ -157,12 +159,11 @@ app.post('/sms', async (req, res) => {
         if (jsonMatch) {
             try {
                 const parsed = JSON.parse(jsonMatch[1]);
-                if (parsed.has_deadline && parsed.minutes_from_now) {
-                    const target = new Date(Date.now() + parsed.minutes_from_now * 60000);
+                if (parsed.has_deadline && parsed.target_iso) {
                     await supabase.from('reminders').insert([{
                         phone_number: fromNumber,
                         goal_text: parsed.goal || 'your commitment',
-                        target_time: target.toISOString(),
+                        target_time: new Date(parsed.target_iso).toISOString(),
                     }]);
                 }
             } catch (e) {
