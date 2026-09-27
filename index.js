@@ -20,9 +20,7 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// In-memory locks and message history
-const activeLocks = new Set();
-const userHistories = new Map(); // phone -> [{ role: 'user'|'model', text: '' }]
+const userHistories = new Map();
 
 const BOUNCER_SYSTEM_PROMPT = `
 You are "Bouncer", the user's chill best friend and accountability buddy on WhatsApp.
@@ -33,14 +31,19 @@ Your texting style:
 - If they state a plan, acknowledge it casually ("bet, chest at 9pm. see you then").
 - If they actually send proof of work, give them props like a real friend.
 - If they make excuses, send fake proof, or slack off, clown them and call them a chud.
-- Remember the recent messages in context so you never ask them something they literally just told you.
+- Remember recent context so you never ask something they literally just told you.
+
+IMPORTANT EXTRACTION INSTRUCTION:
+If the user committed to an action with an implied or explicit deadline in their message (e.g., "gym at 11pm", "running in 30 mins"), output a hidden JSON tag at the very end of your response formatted EXACTLY like this:
+<<<{"has_deadline": true, "minutes_from_now": 30, "goal": "gym"}>>>
+Estimate "minutes_from_now" relative to the current conversation. If there is NO time commitment, DO NOT output any <<<>>> tags.
 `;
 
 const SALES_PROMPT_DIRECTIVE = `
 [CONTEXT: User's 3-day trial is up. You are not letting them log new workouts until they subscribe to Pro for $4.99/mo. Keep your chill friend tone, no harsh corporate walls. Tell them: "crap dude your free trial just ran out. grab the pass for 5 bucks here so we can keep going: https://buy.stripe.com/your_link_here". If they complain about 5 bucks, tell them if 5 bucks gets them off the couch it's worth it.]
 `;
 
-// Helper: Convert Twilio MMS URL to Gemini-compatible generative part
+// Helper: Convert Twilio MMS to Gemini Part
 async function urlToGenerativePart(url, mimeType) {
     const response = await axios.get(url, {
         responseType: 'arraybuffer',
@@ -57,61 +60,28 @@ async function urlToGenerativePart(url, mimeType) {
     };
 }
 
-// Resilient Gemini generator locked to the active working model
-async function generateWithRetry(promptContent, retries = 2) {
-    const models = ['gemini-3.8-flash'];
+// Resilient Gemini Generator
+async function generateWithRetry(promptContent, retries = 3) {
+    const model = genAI.getGenerativeModel({ model: 'gemini-3.8-flash' });
 
-    for (const modelName of models) {
+    for (let attempt = 0; attempt < retries; attempt++) {
         try {
-            const selectedModel = genAI.getGenerativeModel({ model: modelName });
-            for (let attempt = 0; attempt < retries; attempt++) {
-                try {
-                    const result = await selectedModel.generateContent(promptContent);
-                    return result.response.text().replace(/\n+/g, ' ').trim();
-                } catch (err) {
-                    console.error(`Gemini attempt ${attempt + 1} error:`, err.message || err);
-                    if (err.status === 503 || err.message?.includes('503')) {
-                        await new Promise((res) => setTimeout(res, 1200));
-                    } else {
-                        break;
-                    }
-                }
+            const result = await model.generateContent(promptContent);
+            return result.response.text();
+        } catch (err) {
+            console.error(`Gemini attempt ${attempt + 1} failed:`, err.message || err);
+            if (attempt < retries - 1) {
+                await new Promise((res) => setTimeout(res, 800));
             }
-        } catch (modelInitErr) {
-            console.error(`Skipping ${modelName}:`, modelInitErr.message);
         }
     }
-    throw new Error('All models exhausted');
+    throw new Error('Gemini failed after retries');
 }
 
-// Background retry worker with safe WhatsApp prefixes and error handling
-async function resolveInBackground(fromNumber, promptPayload) {
-    try {
-        const reply = await generateWithRetry(promptPayload, 3);
-
-        const history = userHistories.get(fromNumber) || [];
-        history.push({ role: 'model', text: reply });
-        userHistories.set(fromNumber, history.slice(-6));
-
-        const formattedTo = fromNumber.startsWith('whatsapp:') ? fromNumber : `whatsapp:${fromNumber}`;
-        const formattedFrom = process.env.TWILIO_PHONE_NUMBER.startsWith('whatsapp:')
-            ? process.env.TWILIO_PHONE_NUMBER
-            : `whatsapp:${process.env.TWILIO_PHONE_NUMBER}`;
-
-        await twilioClient.messages.create({
-            from: formattedFrom,
-            to: formattedTo,
-            body: reply,
-        });
-    } catch (err) {
-        console.error('Background worker caught error:', err.message || err);
-    } finally {
-        activeLocks.delete(fromNumber);
-    }
-}
-
+// Keepalive endpoint
 app.get('/', (req, res) => res.status(200).send('Bouncer is active.'));
 
+// Webhook for incoming WhatsApp messages
 app.post('/sms', async (req, res) => {
     const { MessagingResponse } = twilio.twiml;
     const twiml = new MessagingResponse();
@@ -122,15 +92,8 @@ app.post('/sms', async (req, res) => {
     const mediaUrl = req.body.MediaUrl0;
     const mediaContentType = req.body.MediaContentType0;
 
-    // 1. Lock check: if waiting on background retry and user follows up fast
-    if (activeLocks.has(fromNumber)) {
-        twiml.message("just wait a sec");
-        res.type('text/xml');
-        return res.send(twiml.toString());
-    }
-
     try {
-        // 2. Fetch or initialize user in Supabase
+        // 1. Fetch or create user
         let { data: user } = await supabase
             .from('users')
             .select('*')
@@ -156,7 +119,16 @@ app.post('/sms', async (req, res) => {
         const hasValidDate = user && user.trial_ends_at;
         const isExpired = user && user.status === 'trial' && hasValidDate && (new Date() > new Date(user.trial_ends_at));
 
-        // 3. Assemble chat history context
+        // 2. If photo is submitted, mark open reminders as completed
+        if (numMedia > 0) {
+            await supabase
+                .from('reminders')
+                .update({ completed: true })
+                .eq('phone_number', fromNumber)
+                .eq('completed', false);
+        }
+
+        // 3. Assemble chat context
         let history = userHistories.get(fromNumber) || [];
         let historyText = history.map((h) => `${h.role === 'user' ? 'User' : 'Bouncer'}: "${h.text}"`).join('\n');
 
@@ -168,44 +140,99 @@ app.post('/sms', async (req, res) => {
         let promptPayload;
         if (numMedia > 0 && mediaUrl) {
             const imagePart = await urlToGenerativePart(mediaUrl, mediaContentType);
-            const prompt = `${systemInstructions}\nRecent context:\n${historyText}\nUser sent image with caption: "${userText}"`;
+            const prompt = `${systemInstructions}\nRecent context:\n${historyText}\nUser sent image proof with comment: "${userText}"`;
             promptPayload = [prompt, imagePart];
         } else {
             promptPayload = `${systemInstructions}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
         }
 
-        // Append to local history
         history.push({ role: 'user', text: userText || '[sent media]' });
-        userHistories.set(fromNumber, history.slice(-6));
 
-        // 4. Primary generation attempt
-        let botReply;
-        try {
-            botReply = await generateWithRetry(promptPayload, 2);
-        } catch (fastErr) {
-            activeLocks.add(fromNumber);
-            resolveInBackground(fromNumber, promptPayload);
+        // 4. Generate reply
+        const rawReply = await generateWithRetry(promptPayload, 3);
 
-            twiml.message("hold up for a sec");
-            res.type('text/xml');
-            return res.send(twiml.toString());
+        // Extract hidden deadline tag if present
+        let cleanReply = rawReply;
+        const jsonMatch = rawReply.match(/<<<([\s\S]*?)>>>/);
+        if (jsonMatch) {
+            try {
+                const parsed = JSON.parse(jsonMatch[1]);
+                if (parsed.has_deadline && parsed.minutes_from_now) {
+                    const target = new Date(Date.now() + parsed.minutes_from_now * 60000);
+                    await supabase.from('reminders').insert([{
+                        phone_number: fromNumber,
+                        goal_text: parsed.goal || 'your commitment',
+                        target_time: target.toISOString(),
+                    }]);
+                }
+            } catch (e) {
+                console.error('Failed to parse deadline tag:', e);
+            }
+            cleanReply = rawReply.replace(/<<<[\s\S]*?>>>/g, '').trim();
         }
 
-        // Save Bouncer response to history
-        history.push({ role: 'model', text: botReply });
+        cleanReply = cleanReply.replace(/\n+/g, ' ').trim();
+
+        history.push({ role: 'model', text: cleanReply });
         userHistories.set(fromNumber, history.slice(-6));
 
-        twiml.message(botReply);
+        twiml.message(cleanReply);
         res.type('text/xml');
         res.send(twiml.toString());
 
     } catch (err) {
         console.error('Fatal route error:', err.message || err);
-        activeLocks.delete(fromNumber);
-
-        twiml.message("my bad phone lagged out for a sec, say that again?");
+        twiml.message("my bad phone lagged out, say that again?");
         res.type('text/xml');
         res.send(twiml.toString());
+    }
+});
+
+// 5. Automated Nagging Cron Endpoint
+app.get('/cron/check-reminders', async (req, res) => {
+    try {
+        const now = new Date().toISOString();
+
+        // Find overdue, uncompleted, unnagged goals
+        const { data: overdueList, error } = await supabase
+            .from('reminders')
+            .select('*')
+            .eq('completed', false)
+            .eq('nagged', false)
+            .lte('target_time', now);
+
+        if (error) throw error;
+
+        for (const item of overdueList || []) {
+            const nagPrompt = `
+You are Bouncer. The user committed to "${item.goal_text}" by now and has NOT sent any proof or checked in.
+Roast them in 1 short casual text message. Call them a chud or tell them to get off the couch and send proof.
+Single line text bubble only, lowercase, no line breaks.
+`;
+            const roast = (await generateWithRetry(nagPrompt, 2)).replace(/\n+/g, ' ').trim();
+
+            const formattedTo = item.phone_number.startsWith('whatsapp:') ? item.phone_number : `whatsapp:${item.phone_number}`;
+            const formattedFrom = process.env.TWILIO_PHONE_NUMBER.startsWith('whatsapp:')
+                ? process.env.TWILIO_PHONE_NUMBER
+                : `whatsapp:${process.env.TWILIO_PHONE_NUMBER}`;
+
+            await twilioClient.messages.create({
+                from: formattedFrom,
+                to: formattedTo,
+                body: roast,
+            });
+
+            // Mark as nagged so we don't spam them repeatedly
+            await supabase
+                .from('reminders')
+                .update({ nagged: true })
+                .eq('id', item.id);
+        }
+
+        res.status(200).json({ checked: overdueList ? overdueList.length : 0 });
+    } catch (err) {
+        console.error('Cron check error:', err.message || err);
+        res.status(500).send('Cron failed');
     }
 });
 
