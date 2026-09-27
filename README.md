@@ -1,6 +1,6 @@
-# GymBot — SMS gym accountability roast bot
+# Bouncer — SMS accountability roast bot
 
-Texts you to hold you to your gym commitments. Say "going to the gym later" → it
+Texts you to hold you to your commitments. Say "going to the gym later" → it
 tracks it. Send a photo before midnight → hype text. Ghost it → roast text.
 
 ## How it works
@@ -18,9 +18,7 @@ tracks it. Send a photo before midnight → hype text. Ghost it → roast text.
    - Find your Account SID and Auth Token on the Twilio Console dashboard
    - Buy/activate a phone number that supports SMS + MMS (for photos)
 
-2. **Get an Anthropic API key**: https://console.anthropic.com
-   - Create a key under Settings → API Keys
-   - Note: this is billed separately from a claude.ai subscription
+2. **Get a gemini API key**
 
 3. **Install dependencies**
    ```
