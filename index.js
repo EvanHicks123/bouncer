@@ -20,7 +20,7 @@ const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_A
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// In-memory state locks and message history
+// In-memory locks and message history
 const activeLocks = new Set();
 const userHistories = new Map(); // phone -> [{ role: 'user'|'model', text: '' }]
 
@@ -58,51 +58,55 @@ async function urlToGenerativePart(url, mimeType) {
 }
 
 // Resilient Gemini generator
-async function generateWithRetry(promptContent, retries = 3) {
-    const models = ['gemini-3.8-flash', 'gemini-3.8-pro'];
+async function generateWithRetry(promptContent, retries = 2) {
+    const models = ['gemini-2.5-flash', 'gemini-2.0-flash'];
 
     for (const modelName of models) {
-        const selectedModel = genAI.getGenerativeModel({ model: modelName });
-        for (let attempt = 0; attempt < retries; attempt++) {
-            try {
-                const result = await selectedModel.generateContent(promptContent);
-                // Clean out extra line breaks so it texts like one single bubble
-                return result.response.text().replace(/\n+/g, ' ').trim();
-            } catch (err) {
-                if (err.status === 503 || err.message?.includes('503')) {
-                    await new Promise((res) => setTimeout(res, 2000));
-                } else {
-                    break;
+        try {
+            const selectedModel = genAI.getGenerativeModel({ model: modelName });
+            for (let attempt = 0; attempt < retries; attempt++) {
+                try {
+                    const result = await selectedModel.generateContent(promptContent);
+                    return result.response.text().replace(/\n+/g, ' ').trim();
+                } catch (err) {
+                    if (err.status === 503 || err.message?.includes('503')) {
+                        await new Promise((res) => setTimeout(res, 1200));
+                    } else {
+                        break;
+                    }
                 }
             }
+        } catch (modelInitErr) {
+            console.error(`Skipping ${modelName}:`, modelInitErr.message);
         }
     }
     throw new Error('All models exhausted');
 }
 
-// Background retry worker if initial attempt hits a delay
-async function resolveInBackground(fromNumber, promptContent) {
+// Background retry worker with safe Twilio message handling
+async function resolveInBackground(fromNumber, promptPayload) {
     try {
-        const reply = await generateWithRetry(promptContent, 5);
+        const reply = await generateWithRetry(promptPayload, 3);
 
-        // Save to history
         const history = userHistories.get(fromNumber) || [];
         history.push({ role: 'model', text: reply });
         userHistories.set(fromNumber, history.slice(-6));
 
+        // Ensure 'whatsapp:' prefix is preserved for Twilio WhatsApp API
+        const formattedTo = fromNumber.startsWith('whatsapp:') ? fromNumber : `whatsapp:${fromNumber}`;
+        const formattedFrom = process.env.TWILIO_PHONE_NUMBER.startsWith('whatsapp:')
+            ? process.env.TWILIO_PHONE_NUMBER
+            : `whatsapp:${process.env.TWILIO_PHONE_NUMBER}`;
+
         await twilioClient.messages.create({
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: fromNumber,
+            from: formattedFrom,
+            to: formattedTo,
             body: reply,
         });
     } catch (err) {
-        console.error('Background worker failed:', err);
-        await twilioClient.messages.create({
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: fromNumber,
-            body: "yo my bad, phone froze up for a second. what were you sayin?",
-        });
+        console.error('Background worker caught error:', err.message || err);
     } finally {
+        // Release the user lock regardless of success or failure
         activeLocks.delete(fromNumber);
     }
 }
@@ -119,15 +123,15 @@ app.post('/sms', async (req, res) => {
     const mediaUrl = req.body.MediaUrl0;
     const mediaContentType = req.body.MediaContentType0;
 
-    // 1. Lock check: if background retry is running and user spams
+    // 1. If currently processing in background and user sends rapid follow-up
     if (activeLocks.has(fromNumber)) {
-        twiml.message("bro just wait a sec");
+        twiml.message("just wait a sec");
         res.type('text/xml');
         return res.send(twiml.toString());
     }
 
     try {
-        // 2. Database user check
+        // 2. Fetch or create Supabase user record
         let { data: user } = await supabase
             .from('users')
             .select('*')
@@ -165,22 +169,22 @@ app.post('/sms', async (req, res) => {
         let promptPayload;
         if (numMedia > 0 && mediaUrl) {
             const imagePart = await urlToGenerativePart(mediaUrl, mediaContentType);
-            const prompt = `${systemInstructions}\nRecent context:\n${historyText}\nUser just sent this image with caption: "${userText}"`;
+            const prompt = `${systemInstructions}\nRecent context:\n${historyText}\nUser sent image with caption: "${userText}"`;
             promptPayload = [prompt, imagePart];
         } else {
             promptPayload = `${systemInstructions}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
         }
 
-        // Update history with incoming message
-        history.push({ role: 'user', text: userText || '[sent an image]' });
+        // Append user input to history
+        history.push({ role: 'user', text: userText || '[sent media]' });
         userHistories.set(fromNumber, history.slice(-6));
 
-        // 4. Try fast generation first (within normal Twilio 4-5s window)
+        // 4. Primary generation attempt
         let botReply;
         try {
-            botReply = await generateWithRetry(promptPayload, 1);
+            botReply = await generateWithRetry(promptPayload, 2);
         } catch (fastErr) {
-            // Model is busy: set lock, send "hold up for a sec", run background loop
+            // Hand off to background worker safely and respond immediately via TwiML
             activeLocks.add(fromNumber);
             resolveInBackground(fromNumber, promptPayload);
 
@@ -198,8 +202,10 @@ app.post('/sms', async (req, res) => {
         res.send(twiml.toString());
 
     } catch (err) {
-        console.error('Fatal route error:', err);
-        twiml.message("hold up for a sec");
+        console.error('Fatal route error:', err.message || err);
+        activeLocks.delete(fromNumber);
+
+        twiml.message("my bad phone lagged out for a sec, say that again?");
         res.type('text/xml');
         res.send(twiml.toString());
     }
