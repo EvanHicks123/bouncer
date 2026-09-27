@@ -14,27 +14,30 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
+// Initialize Twilio
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
 // Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// In-memory state locks and message history
+const activeLocks = new Set();
+const userHistories = new Map(); // phone -> [{ role: 'user'|'model', text: '' }]
+
 const BOUNCER_SYSTEM_PROMPT = `
-You are "Bouncer", the user's friend and accountability partner on WhatsApp. 
-Your personality & dynamic:
-- You text like a real friend in their late teens/early 20s: casual, lowercase/minimal punctuation if it feels natural, current humor ("let's frickin go", calling them a "chud" when they act lazy, teasing banter).
-- When they lock in a commitment: Hype them up like a bro ("8:30 gym session? let's frickin go, lock it in").
-- When they actually deliver and send legitimate proof: Be genuinely supportive and proud of them, not toxic. Give real respect ("alright respect, you actually showed up. let's keep that streak alive").
-- When they slack, make lame excuses, or send lazy/fake proof (floor photos, random objects, bad excuses): Roast their ass ruthlessly and call them out like a friend who refuses to watch them fail ("bro sent a blurry photo of a carpet thinking he beat the system, stop being a chud and go actually lift").
-- Keep messages short and punchy (1 to 3 sentences max). Never sound like a corporate AI bot.
+You are "Bouncer", the user's chill best friend and accountability buddy on WhatsApp.
+Your texting style:
+- Text like a real person texting from their phone: lowercase, super casual, zero emojis unless ironic.
+- NEVER use line breaks or multiple paragraphs. Everything must be ONE single text bubble (1 to 2 short sentences max).
+- NEVER repeat annoying catchphrases like "let's frickin go" or "lock it in" every message. Talk normally.
+- If they state a plan, acknowledge it casually ("bet, chest at 9pm. see you then").
+- If they actually send proof of work, give them props like a real friend.
+- If they make excuses, send fake proof, or slack off, clown them and call them a chud.
+- Remember the recent messages in context so you never ask them something they literally just told you.
 `;
 
 const SALES_PROMPT_DIRECTIVE = `
-IMPORTANT CONTEXT: The user's 3-day free trial has expired and they are NOT on the Pro plan yet.
-Your goal is to gently break the news and persuade them to subscribe ($4.99/mo) while staying completely in character as their friend:
-- Do NOT act like a harsh paywall or a corporate bot.
-- First time breaking the news: Be like "oh crap dude sorry but your trial just ran out... but it's only 4.99 if you wanna keep going: https://buy.stripe.com/your_link_here".
-- If they hesitate, object, or say they don't have $5: Persuade them like a bro ("if this 5 dollars gets your ass off the couch and in the gym then it will be worth it trust me dude").
-- Do NOT accept new workout commitments or verify photos until they subscribe, but do keep bantering and convincing them to get the pass.
-- Always include the checkout link if they seem on the fence: https://buy.stripe.com/your_link_here
+[CONTEXT: User's 3-day trial is up. You are not letting them log new workouts until they subscribe to Pro for $4.99/mo. Keep your chill friend tone, no harsh corporate walls. Tell them: "crap dude your free trial just ran out. grab the pass for 5 bucks here so we can keep going: https://buy.stripe.com/your_link_here". If they complain about 5 bucks, tell them if 5 bucks gets them off the couch it's worth it.]
 `;
 
 // Helper: Convert Twilio MMS URL to Gemini-compatible generative part
@@ -54,8 +57,8 @@ async function urlToGenerativePart(url, mimeType) {
     };
 }
 
-// Resilient Gemini generator using the active 3.8 models
-async function generateWithRetry(promptContent, retries = 2) {
+// Resilient Gemini generator
+async function generateWithRetry(promptContent, retries = 3) {
     const models = ['gemini-3.8-flash', 'gemini-3.8-pro'];
 
     for (const modelName of models) {
@@ -63,40 +66,69 @@ async function generateWithRetry(promptContent, retries = 2) {
         for (let attempt = 0; attempt < retries; attempt++) {
             try {
                 const result = await selectedModel.generateContent(promptContent);
-                return result.response.text();
+                // Clean out extra line breaks so it texts like one single bubble
+                return result.response.text().replace(/\n+/g, ' ').trim();
             } catch (err) {
                 if (err.status === 503 || err.message?.includes('503')) {
-                    console.log(`503 on ${modelName}, waiting 1.5s... (Attempt ${attempt + 1})`);
-                    await new Promise((res) => setTimeout(res, 1500));
+                    await new Promise((res) => setTimeout(res, 2000));
                 } else {
-                    console.error(`Error on ${modelName}:`, err.message || err);
-                    break; // Move to fallback model
+                    break;
                 }
             }
         }
     }
-    throw new Error('All Gemini models and retries exhausted.');
+    throw new Error('All models exhausted');
 }
 
-// 1. Keepalive endpoint for cron-job.org
-app.get('/', (req, res) => {
-    res.status(200).send('Bouncer is active and awake.');
-});
+// Background retry worker if initial attempt hits a delay
+async function resolveInBackground(fromNumber, promptContent) {
+    try {
+        const reply = await generateWithRetry(promptContent, 5);
 
-// 2. Main Twilio WhatsApp Webhook
+        // Save to history
+        const history = userHistories.get(fromNumber) || [];
+        history.push({ role: 'model', text: reply });
+        userHistories.set(fromNumber, history.slice(-6));
+
+        await twilioClient.messages.create({
+            from: process.env.TWILIO_PHONE_NUMBER,
+            to: fromNumber,
+            body: reply,
+        });
+    } catch (err) {
+        console.error('Background worker failed:', err);
+        await twilioClient.messages.create({
+            from: process.env.TWILIO_PHONE_NUMBER,
+            to: fromNumber,
+            body: "yo my bad, phone froze up for a second. what were you sayin?",
+        });
+    } finally {
+        activeLocks.delete(fromNumber);
+    }
+}
+
+app.get('/', (req, res) => res.status(200).send('Bouncer is active.'));
+
 app.post('/sms', async (req, res) => {
     const { MessagingResponse } = twilio.twiml;
     const twiml = new MessagingResponse();
 
-    const fromNumber = req.body.From; // e.g. 'whatsapp:+1234567890'
-    const userText = req.body.Body || '';
+    const fromNumber = req.body.From;
+    const userText = (req.body.Body || '').trim();
     const numMedia = parseInt(req.body.NumMedia || '0', 10);
     const mediaUrl = req.body.MediaUrl0;
     const mediaContentType = req.body.MediaContentType0;
 
+    // 1. Lock check: if background retry is running and user spams
+    if (activeLocks.has(fromNumber)) {
+        twiml.message("bro just wait a sec");
+        res.type('text/xml');
+        return res.send(twiml.toString());
+    }
+
     try {
-        // 1. Check or create user in Supabase
-        let { data: user, error: userFetchError } = await supabase
+        // 2. Database user check
+        let { data: user } = await supabase
             .from('users')
             .select('*')
             .eq('phone_number', fromNumber)
@@ -106,7 +138,7 @@ app.post('/sms', async (req, res) => {
             const trialEnds = new Date();
             trialEnds.setDate(trialEnds.getDate() + 3);
 
-            const { data: newUser, error: insertError } = await supabase
+            const { data: newUser } = await supabase
                 .from('users')
                 .insert([{
                     phone_number: fromNumber,
@@ -115,50 +147,63 @@ app.post('/sms', async (req, res) => {
                 }])
                 .select()
                 .single();
-
-            if (insertError) {
-                console.error('Error creating user:', insertError);
-            }
             user = newUser;
         }
 
-        // 2. Safe check if trial has expired
         const hasValidDate = user && user.trial_ends_at;
         const isExpired = user && user.status === 'trial' && hasValidDate && (new Date() > new Date(user.trial_ends_at));
 
-        // 3. Assemble Prompt based on status
-        let activePrompt = BOUNCER_SYSTEM_PROMPT;
+        // 3. Assemble chat history context
+        let history = userHistories.get(fromNumber) || [];
+        let historyText = history.map((h) => `${h.role === 'user' ? 'User' : 'Bouncer'}: "${h.text}"`).join('\n');
+
+        let systemInstructions = BOUNCER_SYSTEM_PROMPT;
         if (isExpired && user.status !== 'pro') {
-            activePrompt += `\n${SALES_PROMPT_DIRECTIVE}`;
+            systemInstructions += `\n${SALES_PROMPT_DIRECTIVE}`;
         }
 
-        // 4. Generate AI response
-        let botReply = '';
-
+        let promptPayload;
         if (numMedia > 0 && mediaUrl) {
             const imagePart = await urlToGenerativePart(mediaUrl, mediaContentType);
-            const prompt = `${activePrompt}\nUser submitted an image proof with message: "${userText}".`;
-            botReply = await generateWithRetry([prompt, imagePart]);
+            const prompt = `${systemInstructions}\nRecent context:\n${historyText}\nUser just sent this image with caption: "${userText}"`;
+            promptPayload = [prompt, imagePart];
         } else {
-            const prompt = `${activePrompt}\nUser message: "${userText}"`;
-            botReply = await generateWithRetry(prompt);
+            promptPayload = `${systemInstructions}\nRecent context:\n${historyText}\nUser: "${userText}"\nBouncer:`;
         }
 
-        // 5. Send back via TwiML XML
+        // Update history with incoming message
+        history.push({ role: 'user', text: userText || '[sent an image]' });
+        userHistories.set(fromNumber, history.slice(-6));
+
+        // 4. Try fast generation first (within normal Twilio 4-5s window)
+        let botReply;
+        try {
+            botReply = await generateWithRetry(promptPayload, 1);
+        } catch (fastErr) {
+            // Model is busy: set lock, send "hold up for a sec", run background loop
+            activeLocks.add(fromNumber);
+            resolveInBackground(fromNumber, promptPayload);
+
+            twiml.message("hold up for a sec");
+            res.type('text/xml');
+            return res.send(twiml.toString());
+        }
+
+        // Save Bouncer response to history
+        history.push({ role: 'model', text: botReply });
+        userHistories.set(fromNumber, history.slice(-6));
+
         twiml.message(botReply);
         res.type('text/xml');
         res.send(twiml.toString());
 
     } catch (err) {
-        console.error('Webhook processing error:', err);
-
-        twiml.message("yo dude the message isnt working send it again in thirty seconds");
+        console.error('Fatal route error:', err);
+        twiml.message("hold up for a sec");
         res.type('text/xml');
         res.send(twiml.toString());
     }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`Bouncer server live on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Bouncer running on port ${PORT}`));
