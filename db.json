@@ -1,0 +1,91 @@
+{
+  "users": {
+    "whatsapp:+12508807335": {
+      "commitments": [
+        {
+          "id": "1790470689512",
+          "text": "Hey dude imma go to the gym soon",
+          "createdAt": "2026-09-27T00:58:09.512Z",
+          "deadline": "2026-09-27T06:59:59.999Z",
+          "status": "open",
+          "nudgeCount": 0,
+          "nextNudgeAt": "2026-09-27T01:38:09.512Z"
+        }
+      ],
+      "history": [
+        {
+          "role": "user",
+          "text": "Hey dude imma go to the gym soon"
+        },
+        {
+          "role": "bot",
+          "text": "my bad bro connection glitched. you still hitting it today?"
+        },
+        {
+          "role": "user",
+          "text": "Hey dude imma go to the gym soon"
+        },
+        {
+          "role": "bot",
+          "text": "my bad bro connection glitched. you still hitting it today?"
+        },
+        {
+          "role": "user",
+          "text": "Hey dude imma go to the gym soon"
+        },
+        {
+          "role": "bot",
+          "text": "yessir lets get it! what we hitting today? 💪"
+        },
+        {
+          "role": "user",
+          "text": "Imma hit push today or might even do like a upper day depending on how I’m feeling"
+        },
+        {
+          "role": "bot",
+          "text": "my bad bro connection glitched. you still hitting it today?"
+        },
+        {
+          "role": "user",
+          "text": "Hey dude imma go to the gym soon"
+        },
+        {
+          "role": "bot",
+          "text": "say less bro, stop stalling and get after it 😤💪"
+        },
+        {
+          "role": "user",
+          "text": "Bet"
+        },
+        {
+          "role": "bot",
+          "text": "lock in bro, lmk when you're through the doors 🫡"
+        },
+        {
+          "role": "user",
+          "text": "I kinda don’t wanna go anymore tho"
+        },
+        {
+          "role": "bot",
+          "text": "nah bro do not fold on me now 💀 just put your shoes on and get through the door, you'll regret skipping way more"
+        },
+        {
+          "role": "user",
+          "text": "I’m a little sick tho"
+        },
+        {
+          "role": "bot",
+          "text": "ah damn, if you're actually sick rest up bro, don't be that guy getting the whole gym sick 🤝 hydrate and we hit it tomorrow"
+        },
+        {
+          "role": "user",
+          "text": "Nah I’m not actually sick I lied"
+        },
+        {
+          "role": "bot",
+          "text": "caught in 4k bro 💀 no more excuses, lace up and get over there right now"
+        }
+      ]
+    }
+  }
+}
