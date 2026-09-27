@@ -201,38 +201,59 @@ app.get('/cron/check-reminders', async (req, res) => {
             .eq('nagged', false)
             .lte('target_time', now);
 
-        if (error) throw error;
+        if (error) {
+            console.error('Supabase query error:', error);
+            return res.status(200).json({ status: 'db_error', message: error.message });
+        }
 
-        for (const item of overdueList || []) {
-            const nagPrompt = `
+        if (!overdueList || overdueList.length === 0) {
+            return res.status(200).json({ checked: 0 });
+        }
+
+        for (const item of overdueList) {
+            try {
+                const nagPrompt = `
 You are Bouncer. The user committed to "${item.goal_text}" by now and has NOT sent any proof or checked in.
 Roast them in 1 short casual text message. Call them a chud or tell them to get off the couch and send proof.
 Single line text bubble only, lowercase, no line breaks.
 `;
-            const roast = (await generateWithRetry(nagPrompt, 2)).replace(/\n+/g, ' ').trim();
+                const rawRoast = await generateWithRetry(nagPrompt, 2);
+                const roast = rawRoast.replace(/\n+/g, ' ').trim();
 
-            const formattedTo = item.phone_number.startsWith('whatsapp:') ? item.phone_number : `whatsapp:${item.phone_number}`;
-            const formattedFrom = process.env.TWILIO_PHONE_NUMBER.startsWith('whatsapp:')
-                ? process.env.TWILIO_PHONE_NUMBER
-                : `whatsapp:${process.env.TWILIO_PHONE_NUMBER}`;
+                // Ensure both From and To have the exact 'whatsapp:' prefix required by Twilio
+                const rawTo = item.phone_number.replace(/^whatsapp:/, '').trim();
+                const rawFrom = (process.env.TWILIO_PHONE_NUMBER || '').replace(/^whatsapp:/, '').trim();
 
-            await twilioClient.messages.create({
-                from: formattedFrom,
-                to: formattedTo,
-                body: roast,
-            });
+                const formattedTo = `whatsapp:${rawTo}`;
+                const formattedFrom = `whatsapp:${rawFrom}`;
 
-            // Mark as nagged so we don't spam them repeatedly
-            await supabase
-                .from('reminders')
-                .update({ nagged: true })
-                .eq('id', item.id);
+                await twilioClient.messages.create({
+                    from: formattedFrom,
+                    to: formattedTo,
+                    body: roast,
+                });
+
+                // Mark as nagged on successful send
+                await supabase
+                    .from('reminders')
+                    .update({ nagged: true })
+                    .eq('id', item.id);
+
+            } catch (sendErr) {
+                console.error(`Failed to send nag message for reminder ${item.id}:`, sendErr.message || sendErr);
+                // Mark as nagged even on failure so it stops choking future cron runs
+                await supabase
+                    .from('reminders')
+                    .update({ nagged: true })
+                    .eq('id', item.id);
+            }
         }
 
-        res.status(200).json({ checked: overdueList ? overdueList.length : 0 });
+        // Always respond with 200 so cron-job.org stays alive
+        res.status(200).json({ checked: overdueList.length });
     } catch (err) {
-        console.error('Cron check error:', err.message || err);
-        res.status(500).send('Cron failed');
+        console.error('Fatal cron check error:', err.message || err);
+        res.status(200).json({ status: 'error', error: err.message });
     }
 });
 
