@@ -23,15 +23,15 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const userHistories = new Map();
 
 const BOUNCER_SYSTEM_PROMPT = `
-You are "Bouncer", the user's chill best friend and accountability buddy on WhatsApp.
+You are "Bouncer", the user's chill best friend and accountability buddy over text.
 Your texting style:
 - Text like a real person texting from their phone: lowercase, super casual, zero emojis unless ironic.
 - NEVER use line breaks or multiple paragraphs. Everything must be ONE single text bubble (1 to 2 short sentences max).
+- NEVER repeat annoying catchphrases like "let's frickin go" or "lock it in" every message. Talk normally.
 - If they state a plan, acknowledge it casually ("bet, chest at 9pm. see you then").
 - If they actually send proof of work, give them props like a real friend.
 - If they make excuses, send fake proof, or slack off, clown them and call them a chud.
 - Remember recent context so you never ask something they literally just told you.
-- Remember recent context so that if they keep pushing tasks back you get impatient and start to roast after too many pushbacks be gradual.
 
 IMPORTANT EXTRACTION INSTRUCTIONS:
 1. Deadlines:
@@ -88,7 +88,7 @@ async function generateWithRetry(promptContent, retries = 3) {
 // Keepalive endpoint
 app.get('/', (req, res) => res.status(200).send('Bouncer is active.'));
 
-// Webhook for incoming WhatsApp messages
+// Webhook for incoming SMS messages
 app.post('/sms', async (req, res) => {
     const { MessagingResponse } = twilio.twiml;
     const twiml = new MessagingResponse();
@@ -191,7 +191,7 @@ app.post('/sms', async (req, res) => {
                         const target = new Date(Date.now() + Math.max(1, parsed.minutes_from_now) * 60000);
                         await supabase.from('reminders').insert([{
                             phone_number: fromNumber,
-                            goal_text: parsed.goal || 'your commitment',
+                            goal_text: parsed.goal || 'your task',
                             target_time: target.toISOString(),
                         }]);
                     }
@@ -232,7 +232,6 @@ app.get('/cron/check-reminders', async (req, res) => {
     try {
         const now = new Date().toISOString();
 
-        // Find overdue, uncompleted, unnagged goals
         const { data: overdueList, error } = await supabase
             .from('reminders')
             .select('*')
@@ -249,6 +248,8 @@ app.get('/cron/check-reminders', async (req, res) => {
             return res.status(200).json({ checked: 0 });
         }
 
+        const results = [];
+
         for (const item of overdueList) {
             try {
                 const nagPrompt = `
@@ -262,31 +263,36 @@ Single line text bubble only, lowercase, no line breaks.
                 const rawTo = item.phone_number.replace(/^whatsapp:/, '').trim();
                 const rawFrom = (process.env.TWILIO_PHONE_NUMBER || '').replace(/^whatsapp:/, '').trim();
 
-                const formattedTo = `whatsapp:${rawTo}`;
-                const formattedFrom = `whatsapp:${rawFrom}`;
-
-                await twilioClient.messages.create({
-                    from: formattedFrom,
-                    to: formattedTo,
+                // Send standard SMS directly without templates
+                const msg = await twilioClient.messages.create({
+                    from: rawFrom,
+                    to: rawTo,
                     body: roast,
                 });
 
-                // Mark as nagged on successful send
                 await supabase
                     .from('reminders')
                     .update({ nagged: true })
                     .eq('id', item.id);
 
+                results.push({ id: item.id, status: 'sent', sid: msg.sid });
             } catch (sendErr) {
                 console.error(`Failed to send nag message for reminder ${item.id}:`, sendErr.message || sendErr);
                 await supabase
                     .from('reminders')
                     .update({ nagged: true })
                     .eq('id', item.id);
+
+                results.push({
+                    id: item.id,
+                    status: 'failed',
+                    error: sendErr.message,
+                    code: sendErr.code,
+                });
             }
         }
 
-        res.status(200).json({ checked: overdueList.length });
+        res.status(200).json({ checked: overdueList.length, results });
     } catch (err) {
         console.error('Fatal cron check error:', err.message || err);
         res.status(200).json({ status: 'error', error: err.message });
