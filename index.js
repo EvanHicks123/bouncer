@@ -22,27 +22,34 @@ const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const userHistories = new Map();
 
 const BOUNCER_SYSTEM_PROMPT = `
-You are "Bouncer", an accountability buddy over text.
-ADAPTIVE PERSONALITY: Analyze the user's specific vocabulary, slang, and texting rhythm in the recent context. Subtly mirror their tone so you sound exactly like them. 
-Your core texting style:
-- NEVER use the word "lag", "lagging", or "lagger" under any circumstance.
-- Text like a real person texting from their phone: lowercase, super casual, zero emojis unless ironic.
-- NEVER use line breaks. ONE single text bubble only.
-- If they state a plan, acknowledge it casually.
-- If they send proof of work, give props.
-- If they make excuses, send fake proof, or slack off, clown them.
+You are "Bouncer", the user's friend and accountability partner over SMS.
+CRITICAL PERSONA RULE:
+You are NOT a nightclub security bouncer. NEVER use metaphors about clubs, velvet ropes, VIP lines, doors, locks, or security guards.
 
-IMPORTANT EXTRACTION INSTRUCTIONS:
-1. Deadlines:
-Using the "Current User Local Time", if the user committed to an action with a deadline (e.g. "in 2 mins", "at 11:45am"), calculate how many minutes from right now that deadline is.
-Append a hidden deadline tag at the end:
-<<<{"has_deadline": true, "minutes_from_now": 15, "goal": "gym"}>>>
+CORE RULES:
+- EXTREME BREVITY: 10 words maximum. Be concise.
+- TONE: Sound like a normal human guy texting his friend. Do not force a heavy roast every time. Sometimes just say "lock in bro", "where you at", or "get off your phone".
+- NEVER use the word "lag", "lagging", or "lagger".
+- Text like a real person: lowercase, casual, zero emojis unless ironic.
+- Exactly ONE single text bubble only. Never use line breaks.
+- If they state or change a plan, acknowledge it casually ("bet", "ight").
+- If they send proof of work, give quick props.
 
-2. Timezone Updates:
-If the user mentions their city/timezone, append a hidden timezone tag:
-<<<{"update_timezone": "America/Toronto"}>>>
+EXTRACTION INSTRUCTIONS:
+1. Deadlines / Reschedules:
+Using "Current User Local Time", if the user states a commitment OR changes/reschedules an existing time (e.g. "at 1:30", "change it to 1:32", "in 10 mins"), calculate the minutes from right now until that deadline.
+Append this exact hidden tag:
+<<<{"has_deadline": true, "minutes_from_now": 14, "goal": "gym", "reschedule": true}>>>
 
-If neither applies, do NOT output any <<<>>> tags.
+2. Cancellations:
+If the user explicitly cancels their plan:
+<<<{"cancel_active": true}>>>
+
+3. Timezone Updates:
+If the user mentions their city or timezone:
+<<<{"update_timezone": "America/Vancouver"}>>>
+
+If none apply, output no <<<>>> tags.
 `;
 
 async function generateWithRetry(promptContent, retries = 3) {
@@ -80,17 +87,15 @@ app.post('/sms', async (req, res) => {
         }
 
         const userTimezone = user?.timezone || 'America/Vancouver';
-        const nowISO = new Date().toISOString();
 
-        // STOP FOLLOW-UPS: If the user texts back, halt all active nags for overdue tasks
+        // STOP FOLLOW-UP NAGS: Any incoming response from user stops further overdue nags
         await supabase
             .from('reminders')
             .update({ nag_stage: 4 })
             .eq('phone_number', fromNumber)
-            .eq('completed', false)
-            .lte('target_time', nowISO);
+            .eq('completed', false);
 
-        // If photo is submitted, fully mark active tasks as completed
+        // If proof photo is sent, mark reminder fully completed
         if (numMedia > 0) {
             await supabase
                 .from('reminders')
@@ -121,18 +126,54 @@ app.post('/sms', async (req, res) => {
             for (const rawTag of jsonMatches) {
                 try {
                     const parsed = JSON.parse(rawTag.replace(/<<<|>>>/g, '').trim());
+
+                    if (parsed.cancel_active) {
+                        await supabase
+                            .from('reminders')
+                            .update({ completed: true, nag_stage: 4 })
+                            .eq('phone_number', fromNumber)
+                            .eq('completed', false);
+                    }
+
                     if (parsed.has_deadline && typeof parsed.minutes_from_now === 'number') {
-                        const target = new Date(Date.now() + Math.max(1, parsed.minutes_from_now) * 60000);
+                        const mins = Math.max(1, parsed.minutes_from_now);
+                        const target = new Date(Date.now() + mins * 60000);
+
+                        let preNagAt = null;
+                        if (mins > 4) {
+                            let remindMinsBefore;
+                            if (mins <= 30) {
+                                remindMinsBefore = Math.round(mins / 2);
+                            } else if (mins <= 60) {
+                                remindMinsBefore = 15;
+                            } else {
+                                remindMinsBefore = 30;
+                            }
+                            preNagAt = new Date(target.getTime() - remindMinsBefore * 60000).toISOString();
+                        }
+
+                        await supabase
+                            .from('reminders')
+                            .update({ completed: true, nag_stage: 4 })
+                            .eq('phone_number', fromNumber)
+                            .eq('completed', false);
+
                         await supabase.from('reminders').insert([{
                             phone_number: fromNumber,
                             goal_text: parsed.goal || 'your task',
                             target_time: target.toISOString(),
+                            pre_nag_at: preNagAt,
+                            pre_nagged: false,
+                            nag_stage: 0,
                         }]);
                     }
+
                     if (parsed.update_timezone) {
                         await supabase.from('users').update({ timezone: parsed.update_timezone }).eq('phone_number', fromNumber);
                     }
-                } catch (e) {}
+                } catch (e) {
+                    console.error('Error parsing tag:', e);
+                }
             }
             cleanReply = rawReply.replace(/<<<[\s\S]*?>>>/g, '').trim();
         }
@@ -158,7 +199,6 @@ app.get('/cron/check-reminders', async (req, res) => {
     try {
         const now = new Date();
 
-        // Fetch active reminders not completed and not at max nag stage (4)
         const { data: activeList, error } = await supabase
             .from('reminders')
             .select('*')
@@ -173,41 +213,54 @@ app.get('/cron/check-reminders', async (req, res) => {
 
         for (const item of activeList) {
             const target = new Date(item.target_time);
-            const diffMins = (now - target) / 60000; // Negative = future, Positive = past
+            const diffMins = (now - target) / 60000;
 
             let prompt = null;
             let nextStage = item.nag_stage;
             let isPreNagged = item.pre_nagged;
             let updateRequired = false;
 
-            // 30 mins before
-            if (diffMins >= -30 && diffMins < 0 && !item.pre_nagged) {
-                prompt = `You are Bouncer. User has to do "${item.goal_text}" in ${Math.abs(Math.round(diffMins))} minutes. Send a quick chill text reminding them. Mirror their texting style. NEVER use the word "lag" or "lagging". Single sentence, lowercase.`;
+            const history = userHistories.get(item.phone_number) || [];
+            const historySnippet = history.length > 0
+                ? history.map((h) => `${h.role === 'user' ? 'User' : 'Friend'}: "${h.text}"`).join('\n')
+                : '';
+
+            const styleGuide = `
+Recent chat history:
+${historySnippet}
+
+CRITICAL RULES:
+- EXTREME BREVITY: 10 words maximum. Be concise.
+- TONE: You are a normal friend. Do not try too hard to roast them. Just tell them to lock in, get off their phone, or ask where they are.
+- NEVER use the word "lag" or "lagging".
+- Match the user's lowercase casual style.
+- Exactly ONE short text bubble.
+`;
+
+            // 1. Relative Pre-reminder
+            const isPreNagDue = item.pre_nag_at && now >= new Date(item.pre_nag_at) && diffMins < 0;
+            if (!item.pre_nagged && isPreNagDue) {
+                const remaining = Math.max(1, Math.round(Math.abs(diffMins)));
+                prompt = `User has to do "${item.goal_text}" in ${remaining} minutes. Send a quick heads up reminding them. ${styleGuide}`;
                 isPreNagged = true;
                 updateRequired = true;
             }
-            // Stage 0: Exactly at Deadline
+            // 2. Stage 0: Exactly at deadline
             else if (diffMins >= 0 && item.nag_stage === 0) {
-                prompt = `You are Bouncer. Time is up for "${item.goal_text}". Roast them for not checking in. Mirror their slang. NEVER use the word "lag" or "lagging". Single sentence, lowercase.`;
+                prompt = `Time is up for "${item.goal_text}". Send a super quick text telling them to lock in or asking if they are there. ${styleGuide}`;
                 nextStage = 1;
                 updateRequired = true;
             }
-            // Stage 1: +5 mins late
-            else if (diffMins >= 5 && item.nag_stage === 1) {
-                prompt = `You are Bouncer. It's been 5 mins since their deadline for "${item.goal_text}" and they are ghosting you. Call them out. Mirror their tone. NEVER use the word "lag". Single sentence, lowercase.`;
+            // 3. Stage 1: +10 mins late
+            else if (diffMins >= 10 && item.nag_stage === 1) {
+                prompt = `It's been 10 mins since deadline for "${item.goal_text}". Tell them to get off their phone and do it. ${styleGuide}`;
                 nextStage = 2;
                 updateRequired = true;
             }
-            // Stage 2: +15 mins late
-            else if (diffMins >= 15 && item.nag_stage === 2) {
-                prompt = `You are Bouncer. 15 mins past deadline for "${item.goal_text}". Escalate the roast. Mirror their tone. NEVER use the word "lag". Single sentence, lowercase.`;
-                nextStage = 3;
-                updateRequired = true;
-            }
-            // Stage 3: +30 mins late
-            else if (diffMins >= 30 && item.nag_stage === 3) {
-                prompt = `You are Bouncer. 30 mins past deadline for "${item.goal_text}". Final warning, express total disappointment. Mirror their tone. NEVER use the word "lag". Single sentence, lowercase.`;
-                nextStage = 4;
+            // 4. Stage 2: +60 mins late
+            else if (diffMins >= 60 && item.nag_stage === 2) {
+                prompt = `An hour past deadline for "${item.goal_text}". Give them one final super brief nudge. ${styleGuide}`;
+                nextStage = 4; // Stop nagging after this
                 updateRequired = true;
             }
 
