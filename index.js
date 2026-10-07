@@ -1,25 +1,55 @@
 require('dotenv').config();
 const express = require('express');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 const twilio = require('twilio');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
 
 // Initialize Supabase
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// Initialize Twilio
+// Initialize Twilio & Gemini
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-// Initialize Gemini
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 const userHistories = new Map();
+
+// 🚨 STRIPE WEBHOOK MUST BE BEFORE express.json 🚨
+app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    const endpointSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, endpointSecret);
+    } catch (err) {
+        console.error(`Webhook signature failed: ${err.message}`);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const phoneNumber = session.client_reference_id; // The phone number passed in the URL
+
+        if (phoneNumber) {
+            console.log(`Upgrading user ${phoneNumber} to PRO`);
+            await supabase
+                .from('users')
+                .update({ status: 'pro' })
+                .eq('phone_number', phoneNumber);
+        }
+    }
+
+    res.status(200).send();
+});
+
+// Load body parsers for Twilio routes
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
 const BOUNCER_SYSTEM_PROMPT = `
 You are "Bouncer", the user's friend and accountability partner over SMS.
@@ -82,11 +112,25 @@ app.post('/sms', async (req, res) => {
             const { data: newUser } = await supabase.from('users').insert([{
                 phone_number: fromNumber,
                 timezone: 'America/Vancouver',
+                status: 'trial'
             }]).select().single();
             user = newUser;
         }
 
         const userTimezone = user?.timezone || 'America/Vancouver';
+
+        // Trial Check Logic (3 Days)
+        const createdDate = new Date(user.created_at || Date.now());
+        const daysSinceCreated = (Date.now() - createdDate.getTime()) / (1000 * 60 * 60 * 24);
+        const isExpired = daysSinceCreated > 3;
+
+        // Swap 'your_link_here' with your actual Stripe payment link later
+        const paymentLink = `https://buy.stripe.com/test_3cI6oJ0JjgpZ8xBePNbbG00?client_reference_id=${encodeURIComponent(fromNumber)}`;
+        let systemInstructions = BOUNCER_SYSTEM_PROMPT;
+
+        if (isExpired && user.status !== 'pro') {
+            systemInstructions += `\n[CRITICAL SYSTEM DIRECTIVE: The user's 3-day trial has EXPIRED. Refuse to set any new reminders or process any proof until they pay. Tell them exactly this and nothing else: "trial's up. grab the pass for 5 bucks here so we can keep going: ${paymentLink}"]`;
+        }
 
         // STOP FOLLOW-UP NAGS: Any incoming response from user stops further overdue nags
         await supabase
@@ -114,7 +158,7 @@ app.post('/sms', async (req, res) => {
         let history = userHistories.get(fromNumber) || [];
         let historyText = history.map((h) => `${h.role === 'user' ? 'User' : 'Bouncer'}: "${h.text}"`).join('\n');
 
-        let promptPayload = `${BOUNCER_SYSTEM_PROMPT}\nUser Timezone: ${userTimezone}\nCurrent User Local Time: ${localTimeStr}\nRecent context:\n${historyText}\nUser: "${userText || '[sent image]'}"\nBouncer:`;
+        let promptPayload = `${systemInstructions}\nUser Timezone: ${userTimezone}\nCurrent User Local Time: ${localTimeStr}\nRecent context:\n${historyText}\nUser: "${userText || '[sent image]'}"\nBouncer:`;
 
         history.push({ role: 'user', text: userText || '[sent media]' });
 
@@ -135,7 +179,7 @@ app.post('/sms', async (req, res) => {
                             .eq('completed', false);
                     }
 
-                    if (parsed.has_deadline && typeof parsed.minutes_from_now === 'number') {
+                    if (parsed.has_deadline && typeof parsed.minutes_from_now === 'number' && !(isExpired && user.status !== 'pro')) {
                         const mins = Math.max(1, parsed.minutes_from_now);
                         const target = new Date(Date.now() + mins * 60000);
 
