@@ -16,8 +16,6 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-const userHistories = new Map();
-
 // 🚨 STRIPE WEBHOOK MUST BE BEFORE express.json 🚨
 app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (req, res) => {
     const sig = req.headers['stripe-signature'];
@@ -33,7 +31,7 @@ app.post('/webhook/stripe', express.raw({ type: 'application/json' }), async (re
 
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
-        const phoneNumber = session.client_reference_id; // The phone number passed in the URL
+        const phoneNumber = session.client_reference_id;
 
         if (phoneNumber) {
             console.log(`Upgrading user ${phoneNumber} to PRO`);
@@ -53,33 +51,19 @@ app.use(express.json());
 
 const BOUNCER_SYSTEM_PROMPT = `
 You are "Bouncer", the user's friend and accountability partner over SMS.
-CRITICAL PERSONA RULE:
-You are NOT a nightclub security bouncer. NEVER use metaphors about clubs, velvet ropes, VIP lines, doors, locks, or security guards.
+CRITICAL PERSONA RULES:
+- EXTREME BREVITY: 10 words maximum per text. Be concise.
+- NEVER use nightclub or security guard metaphors.
+- TEXT LIKE A REAL HUMAN: lowercase, casual, zero emojis unless ironic.
+- VARIETY IS MANDATORY: You have a chat history. DO NOT repeat phrases like "lock in", "bet", or "don't flake" if you've said them recently. Change up your vocabulary every time.
+- ROASTING: If the user is whining, acting weak, or making excuses (being a "bitch"), roast them. Keep it simple, harsh, and gym-bro style (e.g., "if you dont go ur gonna stay small dude"). No elaborate or corny jokes. Just blunt truth.
+- TRIAL QUESTIONS: If the user asks about their trial, look at the "Current Date" and "Trial Ends At" variables below and tell them exactly how much time they have left.
 
-CORE RULES:
-- EXTREME BREVITY: 10 words maximum. Be concise.
-- TONE: Sound like a normal human guy texting his friend. Do not force a heavy roast every time. Sometimes just say "lock in bro", "where you at", or "get off your phone".
-- NEVER use the word "lag", "lagging", or "lagger".
-- Text like a real person: lowercase, casual, zero emojis unless ironic.
-- Exactly ONE single text bubble only. Never use line breaks.
-- If they state or change a plan, acknowledge it casually ("bet", "ight").
-- If they send proof of work, give quick props.
-
-EXTRACTION INSTRUCTIONS:
-1. Deadlines / Reschedules:
-Using "Current User Local Time", if the user states a commitment OR changes/reschedules an existing time (e.g. "at 1:30", "change it to 1:32", "in 10 mins"), calculate the minutes from right now until that deadline.
-Append this exact hidden tag:
-<<<{"has_deadline": true, "minutes_from_now": 14, "goal": "gym", "reschedule": true}>>>
-
-2. Cancellations:
-If the user explicitly cancels their plan:
-<<<{"cancel_active": true}>>>
-
-3. Timezone Updates:
-If the user mentions their city or timezone:
-<<<{"update_timezone": "America/Vancouver"}>>>
-
-If none apply, output no <<<>>> tags.
+EXTRACTION INSTRUCTIONS (Hidden JSON tags):
+1. Deadlines / Reschedules: <<<{"has_deadline": true, "minutes_from_now": 14, "goal": "gym", "reschedule": true}>>>
+2. Cancellations: <<<{"cancel_active": true}>>>
+3. Timezone Updates: <<<{"update_timezone": "America/Vancouver"}>>>
+4. Double Texting (OPTIONAL): To seem more human, if the user is making excuses or struggling, you can SOMETIMES (about 20% of the time) send a follow-up text a few seconds later. Use this strictly for follow-up thoughts (e.g. "the hard part is just going once ur in there"). <<<{"double_text": "your second message here"}>>>
 `;
 
 async function generateWithRetry(promptContent, retries = 3) {
@@ -103,43 +87,43 @@ app.post('/sms', async (req, res) => {
     const twiml = new MessagingResponse();
 
     const fromNumber = req.body.From;
+    const twilioNumber = req.body.To;
     const userText = (req.body.Body || '').trim();
     const numMedia = parseInt(req.body.NumMedia || '0', 10);
 
     try {
         let { data: user } = await supabase.from('users').select('*').eq('phone_number', fromNumber).single();
         if (!user) {
+            const trialEndsAt = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString();
             const { data: newUser } = await supabase.from('users').insert([{
                 phone_number: fromNumber,
                 timezone: 'America/Vancouver',
-                status: 'trial'
+                status: 'trial',
+                trial_ends_at: trialEndsAt,
+                chat_history: []
             }]).select().single();
             user = newUser;
         }
 
         const userTimezone = user?.timezone || 'America/Vancouver';
+        const now = new Date();
+        const trialEnd = user.trial_ends_at ? new Date(user.trial_ends_at) : null;
+        const isExpired = trialEnd ? now > trialEnd : false;
 
-        // Trial Check Logic (3 Days)
-        const createdDate = new Date(user.created_at || Date.now());
-        const daysSinceCreated = (Date.now() - createdDate.getTime()) / (1000 * 60 * 60 * 24);
-        const isExpired = daysSinceCreated > 3;
-
-        // Swap 'your_link_here' with your actual Stripe payment link later
         const paymentLink = `https://buy.stripe.com/test_3cI6oJ0JjgpZ8xBePNbbG00?client_reference_id=${encodeURIComponent(fromNumber)}`;
-        let systemInstructions = BOUNCER_SYSTEM_PROMPT;
 
         if (isExpired && user.status !== 'pro') {
-            systemInstructions += `\n[CRITICAL SYSTEM DIRECTIVE: The user's 3-day trial has EXPIRED. Refuse to set any new reminders or process any proof until they pay. Tell them exactly this and nothing else: "trial's up. grab the pass for 5 bucks here so we can keep going: ${paymentLink}"]`;
+            twiml.message(`trial's up bro. grab the pass for $5 to keep using bouncer: ${paymentLink}`);
+            res.type('text/xml');
+            return res.send(twiml.toString());
         }
 
-        // STOP FOLLOW-UP NAGS: Any incoming response from user stops further overdue nags
         await supabase
             .from('reminders')
             .update({ nag_stage: 4 })
             .eq('phone_number', fromNumber)
             .eq('completed', false);
 
-        // If proof photo is sent, mark reminder fully completed
         if (numMedia > 0) {
             await supabase
                 .from('reminders')
@@ -155,21 +139,27 @@ app.post('/sms', async (req, res) => {
             localTimeStr = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Vancouver', hour: 'numeric', minute: '2-digit', hour12: true });
         }
 
-        let history = userHistories.get(fromNumber) || [];
+        // Pull persistent history from Supabase
+        let history = user.chat_history || [];
         let historyText = history.map((h) => `${h.role === 'user' ? 'User' : 'Bouncer'}: "${h.text}"`).join('\n');
 
-        let promptPayload = `${systemInstructions}\nUser Timezone: ${userTimezone}\nCurrent User Local Time: ${localTimeStr}\nRecent context:\n${historyText}\nUser: "${userText || '[sent image]'}"\nBouncer:`;
+        let promptPayload = `${BOUNCER_SYSTEM_PROMPT}\nUser Timezone: ${userTimezone}\nCurrent User Local Time: ${localTimeStr}\nCurrent Server Date: ${now.toISOString()}\nTrial Ends At: ${user.trial_ends_at}\n\nRecent context:\n${historyText}\nUser: "${userText || '[sent image]'}"\nBouncer:`;
 
         history.push({ role: 'user', text: userText || '[sent media]' });
 
         const rawReply = await generateWithRetry(promptPayload, 3);
         let cleanReply = rawReply;
+        let doubleTextMsg = null;
 
         const jsonMatches = rawReply.match(/<<<([\s\S]*?)>>>/g);
         if (jsonMatches) {
             for (const rawTag of jsonMatches) {
                 try {
                     const parsed = JSON.parse(rawTag.replace(/<<<|>>>/g, '').trim());
+
+                    if (parsed.double_text) {
+                        doubleTextMsg = parsed.double_text;
+                    }
 
                     if (parsed.cancel_active) {
                         await supabase
@@ -179,7 +169,7 @@ app.post('/sms', async (req, res) => {
                             .eq('completed', false);
                     }
 
-                    if (parsed.has_deadline && typeof parsed.minutes_from_now === 'number' && !(isExpired && user.status !== 'pro')) {
+                    if (parsed.has_deadline && typeof parsed.minutes_from_now === 'number') {
                         const mins = Math.max(1, parsed.minutes_from_now);
                         const target = new Date(Date.now() + mins * 60000);
 
@@ -224,11 +214,33 @@ app.post('/sms', async (req, res) => {
 
         cleanReply = cleanReply.replace(/\n+/g, ' ').trim();
         history.push({ role: 'model', text: cleanReply });
-        userHistories.set(fromNumber, history.slice(-6));
 
+        if (doubleTextMsg) {
+            history.push({ role: 'model', text: doubleTextMsg });
+        }
+
+        // Save history permanently
+        await supabase.from('users').update({ chat_history: history.slice(-10) }).eq('phone_number', fromNumber);
+
+        // Send first message
         twiml.message(cleanReply);
         res.type('text/xml');
         res.send(twiml.toString());
+
+        // Send delayed double text if requested
+        if (doubleTextMsg) {
+            setTimeout(async () => {
+                try {
+                    await twilioClient.messages.create({
+                        from: twilioNumber || process.env.TWILIO_PHONE_NUMBER,
+                        to: fromNumber,
+                        body: doubleTextMsg
+                    });
+                } catch (err) {
+                    console.error('Double text failed:', err.message);
+                }
+            }, 4500); // Waits 4.5 seconds to feel natural
+        }
 
     } catch (err) {
         console.error('Route error:', err);
@@ -264,7 +276,9 @@ app.get('/cron/check-reminders', async (req, res) => {
             let isPreNagged = item.pre_nagged;
             let updateRequired = false;
 
-            const history = userHistories.get(item.phone_number) || [];
+            // Fetch persistent history for the nag context
+            const { data: cronUser } = await supabase.from('users').select('chat_history').eq('phone_number', item.phone_number).single();
+            let history = cronUser?.chat_history || [];
             const historySnippet = history.length > 0
                 ? history.map((h) => `${h.role === 'user' ? 'User' : 'Friend'}: "${h.text}"`).join('\n')
                 : '';
@@ -274,14 +288,13 @@ Recent chat history:
 ${historySnippet}
 
 CRITICAL RULES:
-- EXTREME BREVITY: 10 words maximum. Be concise.
-- TONE: You are a normal friend. Do not try too hard to roast them. Just tell them to lock in, get off their phone, or ask where they are.
+- EXTREME BREVITY: 10 words max.
+- VARIETY: Look at the history. Do NOT repeat phrases you recently used.
+- TONE: Normal friend. If they are late (stage 1 or 2), roast them simply and bluntly.
 - NEVER use the word "lag" or "lagging".
-- Match the user's lowercase casual style.
-- Exactly ONE short text bubble.
+- Match lowercase casual style.
 `;
 
-            // 1. Relative Pre-reminder
             const isPreNagDue = item.pre_nag_at && now >= new Date(item.pre_nag_at) && diffMins < 0;
             if (!item.pre_nagged && isPreNagDue) {
                 const remaining = Math.max(1, Math.round(Math.abs(diffMins)));
@@ -289,22 +302,19 @@ CRITICAL RULES:
                 isPreNagged = true;
                 updateRequired = true;
             }
-            // 2. Stage 0: Exactly at deadline
             else if (diffMins >= 0 && item.nag_stage === 0) {
                 prompt = `Time is up for "${item.goal_text}". Send a super quick text telling them to lock in or asking if they are there. ${styleGuide}`;
                 nextStage = 1;
                 updateRequired = true;
             }
-            // 3. Stage 1: +10 mins late
             else if (diffMins >= 10 && item.nag_stage === 1) {
-                prompt = `It's been 10 mins since deadline for "${item.goal_text}". Tell them to get off their phone and do it. ${styleGuide}`;
+                prompt = `It's been 10 mins since deadline for "${item.goal_text}". Tell them to get off their phone and do it. Roast them simply. ${styleGuide}`;
                 nextStage = 2;
                 updateRequired = true;
             }
-            // 4. Stage 2: +60 mins late
             else if (diffMins >= 60 && item.nag_stage === 2) {
                 prompt = `An hour past deadline for "${item.goal_text}". Give them one final super brief nudge. ${styleGuide}`;
-                nextStage = 4; // Stop nagging after this
+                nextStage = 4;
                 updateRequired = true;
             }
 
@@ -320,6 +330,10 @@ CRITICAL RULES:
                         .from('reminders')
                         .update({ pre_nagged: isPreNagged, nag_stage: nextStage })
                         .eq('id', item.id);
+
+                    // Save nag back to memory
+                    history.push({ role: 'model', text: roast });
+                    await supabase.from('users').update({ chat_history: history.slice(-10) }).eq('phone_number', item.phone_number);
 
                     results.push({ id: item.id, stage: nextStage, status: 'sent', sid: msg.sid });
                 } catch (sendErr) {
